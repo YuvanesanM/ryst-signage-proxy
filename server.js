@@ -68,13 +68,17 @@ function ghRequest(method, body, cb) {
   req.end();
 }
 
-// Raw public URL — no token needed, used only for /public-schedule (TV display)
-function fetchPublicSchedule(cb) {
+// Unauthenticated GitHub API — public repo, no token, always fresh (no CDN cache)
+function ghRequestPublic(cb) {
+  const path = `/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_FILE}`;
   const opts = {
-    hostname: 'raw.githubusercontent.com',
-    path: `/${GH_OWNER}/${GH_REPO}/main/${GH_FILE}`,
+    hostname: 'api.github.com',
+    path,
     method: 'GET',
-    headers: { 'User-Agent': 'ryst-signage-proxy' },
+    headers: {
+      'Accept':     'application/vnd.github.v3+json',
+      'User-Agent': 'ryst-signage-proxy',
+    },
   };
   const req = https.request(opts, r => {
     let resp = '';
@@ -186,15 +190,16 @@ http.createServer((req, res) => {
     return;
   }
 
-  // GET /public-schedule — TV display, no auth, reads from raw public URL
+  // GET /public-schedule — TV display, no auth, always-fresh GitHub API
   if (req.method === 'GET' && url === '/public-schedule') {
-    fetchPublicSchedule((err, data, status) => {
+    ghRequestPublic((err, data, status) => {
       if (err || status === 404) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ sessions: [] })); return;
       }
       try {
-        const schedule = JSON.parse(data);
+        const ghData = JSON.parse(data);
+        const schedule = JSON.parse(Buffer.from(ghData.content, 'base64').toString('utf8'));
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(schedule));
       } catch(e) {
