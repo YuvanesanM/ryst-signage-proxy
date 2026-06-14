@@ -42,7 +42,7 @@ function verifyToken(token) {
   return crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expected, 'hex'));
 }
 
-// ── GitHub API helper ─────────────────────────────────────────────────
+// ── GitHub API helper (authenticated, for writes) ─────────────────────
 function ghRequest(method, body, cb) {
   const path = `/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_FILE}`;
   const data = body ? JSON.stringify(body) : null;
@@ -70,11 +70,27 @@ function ghRequest(method, body, cb) {
   req.end();
 }
 
+// ── Fetch public schedule from raw GitHub URL (no token needed) ───────
+function fetchPublicSchedule(cb) {
+  const opts = {
+    hostname: 'raw.githubusercontent.com',
+    path: `/${GH_OWNER}/${GH_REPO}/main/${GH_FILE}`,
+    method: 'GET',
+    headers: { 'User-Agent': 'ryst-signage-proxy' },
+  };
+  const req = https.request(opts, r => {
+    let resp = '';
+    r.on('data', c => resp += c);
+    r.on('end',  () => cb(null, resp, r.statusCode));
+  });
+  req.on('error', err => cb(err.message, null, 500));
+  req.end();
+}
+
 // ── HTTP Server ───────────────────────────────────────────────────────
 http.createServer((req, res) => {
   // CORS
   const origin = req.headers.origin || '';
-  // Allow listed origins for credentialed requests; allow * for public TV endpoint
   const corsOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : (origin || '*');
   res.setHeader('Access-Control-Allow-Origin', corsOrigin);
   res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, POST, OPTIONS');
@@ -115,17 +131,15 @@ http.createServer((req, res) => {
       return;
     }
 
-    // GET /schedule — read and decode schedule.json, return clean JSON
+    // GET /schedule — read via raw URL (no token needed for public repo)
     if (req.method === 'GET') {
-      ghRequest('GET', null, (err, data, status) => {
-        if (err) { res.writeHead(500); res.end(JSON.stringify({ error: err })); return; }
-        if (status === 404) {
+      fetchPublicSchedule((err, data, status) => {
+        if (err || status === 404) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ sessions: [] })); return;
         }
         try {
-          const ghData = JSON.parse(data);
-          const schedule = JSON.parse(Buffer.from(ghData.content, 'base64').toString('utf8'));
+          const schedule = JSON.parse(data);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(schedule));
         } catch(e) {
@@ -136,7 +150,7 @@ http.createServer((req, res) => {
       return;
     }
 
-    // PUT /schedule — write schedule.json
+    // PUT /schedule — write schedule.json via authenticated GitHub API
     if (req.method === 'PUT') {
       let body = '';
       req.on('data', c => body += c);
@@ -144,7 +158,7 @@ http.createServer((req, res) => {
         try {
           const scheduleData = JSON.parse(body);
 
-          // First GET to obtain current SHA (required by GitHub API for updates)
+          // GET current SHA (required by GitHub API for updates)
           ghRequest('GET', null, (err, existing, status) => {
             const sha = status !== 404 ? (() => {
               try { return JSON.parse(existing).sha; } catch(e) { return null; }
@@ -174,17 +188,15 @@ http.createServer((req, res) => {
     return;
   }
 
-  // ── GET / — TV display fetches schedule (no auth, read-only) ─────
-  // index.html polls this for live schedule
+  // ── GET /public-schedule — TV display, no auth, reads raw public file ──
   if (req.method === 'GET' && url === '/public-schedule') {
-    ghRequest('GET', null, (err, data, status) => {
+    fetchPublicSchedule((err, data, status) => {
       if (err || status === 404) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ sessions: [] })); return;
       }
       try {
-        const ghData = JSON.parse(data);
-        const schedule = JSON.parse(Buffer.from(ghData.content, 'base64').toString('utf8'));
+        const schedule = JSON.parse(data);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(schedule));
       } catch(e) {
