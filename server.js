@@ -6,7 +6,7 @@ const PORT        = process.env.PORT         || 3000;
 const GH_TOKEN    = process.env.GH_TOKEN;          // Render env var — never in code
 const SET_PASS    = process.env.SET_PASSWORD || 'RYST@set2026'; // Render env var
 const GH_OWNER    = 'yuvanesanm';
-const GH_REPO     = 'ryst-signage';
+const GH_REPO     = 'signage';
 const GH_FILE     = 'schedule.json';
 
 // ── CORS origins allowed ──────────────────────────────────────────────
