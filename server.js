@@ -68,26 +68,6 @@ function ghRequest(method, body, cb) {
   req.end();
 }
 
-// Unauthenticated GitHub API — public repo, no token, always fresh (no CDN cache)
-function ghRequestPublic(cb) {
-  const path = `/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_FILE}`;
-  const opts = {
-    hostname: 'api.github.com',
-    path,
-    method: 'GET',
-    headers: {
-      'Accept':     'application/vnd.github.v3+json',
-      'User-Agent': 'ryst-signage-proxy',
-    },
-  };
-  const req = https.request(opts, r => {
-    let resp = '';
-    r.on('data', c => resp += c);
-    r.on('end',  () => cb(null, resp, r.statusCode));
-  });
-  req.on('error', err => cb(err.message, null, 500));
-  req.end();
-}
 
 http.createServer((req, res) => {
   const origin = req.headers.origin || '';
@@ -190,9 +170,9 @@ http.createServer((req, res) => {
     return;
   }
 
-  // GET /public-schedule — TV display, no auth, always-fresh GitHub API
+  // GET /public-schedule — TV display, no auth required on this route but uses token internally
   if (req.method === 'GET' && url === '/public-schedule') {
-    ghRequestPublic((err, data, status) => {
+    ghRequest('GET', null, (err, data, status) => {
       if (err || status === 404) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ sessions: [] })); return;
