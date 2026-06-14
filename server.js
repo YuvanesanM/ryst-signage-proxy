@@ -3,13 +3,12 @@ const http  = require('http');
 const crypto = require('crypto');
 
 const PORT        = process.env.PORT         || 3000;
-const GH_TOKEN    = process.env.GH_TOKEN;          // Render env var — never in code
-const SET_PASS    = process.env.SET_PASSWORD || 'RYST@set2026'; // Render env var
+const GH_TOKEN    = process.env.GH_TOKEN;
+const SET_PASS    = process.env.SET_PASSWORD || 'RYST@set2026';
 const GH_OWNER    = 'yuvanesanm';
 const GH_REPO     = 'signage';
 const GH_FILE     = 'schedule.json';
 
-// ── CORS origins allowed ──────────────────────────────────────────────
 const ALLOWED_ORIGINS = [
   'https://signage.ryst.in',
   'https://yuvanesanm.github.io',
@@ -18,7 +17,6 @@ const ALLOWED_ORIGINS = [
   'http://127.0.0.1:5500',
 ];
 
-// ── HMAC session tokens (24 h) ────────────────────────────────────────
 const TOKEN_SECRET = crypto
   .createHash('sha256')
   .update('ryst-signage-proxy-' + SET_PASS)
@@ -42,7 +40,7 @@ function verifyToken(token) {
   return crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expected, 'hex'));
 }
 
-// ── GitHub API helper (authenticated, for writes) ─────────────────────
+// Authenticated GitHub API — used for reads (fresh data) and writes
 function ghRequest(method, body, cb) {
   const path = `/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_FILE}`;
   const data = body ? JSON.stringify(body) : null;
@@ -70,7 +68,7 @@ function ghRequest(method, body, cb) {
   req.end();
 }
 
-// ── Fetch public schedule from raw GitHub URL (no token needed) ───────
+// Raw public URL — no token needed, used only for /public-schedule (TV display)
 function fetchPublicSchedule(cb) {
   const opts = {
     hostname: 'raw.githubusercontent.com',
@@ -87,9 +85,7 @@ function fetchPublicSchedule(cb) {
   req.end();
 }
 
-// ── HTTP Server ───────────────────────────────────────────────────────
 http.createServer((req, res) => {
-  // CORS
   const origin = req.headers.origin || '';
   const corsOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : (origin || '*');
   res.setHeader('Access-Control-Allow-Origin', corsOrigin);
@@ -101,7 +97,7 @@ http.createServer((req, res) => {
 
   const url = req.url.split('?')[0];
 
-  // ── POST /auth — password → token ────────────────────────────────
+  // POST /auth — password -> token
   if (req.method === 'POST' && url === '/auth') {
     let body = '';
     req.on('data', c => body += c);
@@ -122,7 +118,7 @@ http.createServer((req, res) => {
     return;
   }
 
-  // ── All /schedule routes require valid token ──────────────────────
+  // /schedule — requires valid session token
   if (url === '/schedule') {
     const token = req.headers['x-token'] || '';
     if (!verifyToken(token)) {
@@ -131,15 +127,17 @@ http.createServer((req, res) => {
       return;
     }
 
-    // GET /schedule — read via raw URL (no token needed for public repo)
+    // GET /schedule — fetch via GitHub API for always-fresh data
     if (req.method === 'GET') {
-      fetchPublicSchedule((err, data, status) => {
-        if (err || status === 404) {
+      ghRequest('GET', null, (err, data, status) => {
+        if (err) { res.writeHead(500); res.end(JSON.stringify({ error: err })); return; }
+        if (status === 404) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ sessions: [] })); return;
         }
         try {
-          const schedule = JSON.parse(data);
+          const ghData = JSON.parse(data);
+          const schedule = JSON.parse(Buffer.from(ghData.content, 'base64').toString('utf8'));
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(schedule));
         } catch(e) {
@@ -150,7 +148,7 @@ http.createServer((req, res) => {
       return;
     }
 
-    // PUT /schedule — write schedule.json via authenticated GitHub API
+    // PUT /schedule — write schedule.json
     if (req.method === 'PUT') {
       let body = '';
       req.on('data', c => body += c);
@@ -188,7 +186,7 @@ http.createServer((req, res) => {
     return;
   }
 
-  // ── GET /public-schedule — TV display, no auth, reads raw public file ──
+  // GET /public-schedule — TV display, no auth, reads from raw public URL
   if (req.method === 'GET' && url === '/public-schedule') {
     fetchPublicSchedule((err, data, status) => {
       if (err || status === 404) {
@@ -207,7 +205,7 @@ http.createServer((req, res) => {
     return;
   }
 
-  // ── Health check ──────────────────────────────────────────────────
+  // Health check
   if (url === '/') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
