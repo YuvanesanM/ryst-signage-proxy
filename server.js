@@ -15,6 +15,7 @@ const ALLOWED_ORIGINS = [
   'https://yuvanesanm.github.io',
   'http://localhost:3000',
   'http://localhost:5500',
+  'http://127.0.0.1:5500',
 ];
 
 // ── HMAC session tokens (24 h) ────────────────────────────────────────
@@ -73,8 +74,9 @@ function ghRequest(method, body, cb) {
 http.createServer((req, res) => {
   // CORS
   const origin = req.headers.origin || '';
-  const corsOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
-  res.setHeader('Access-Control-Allow-Origin',  corsOrigin);
+  // Allow listed origins for credentialed requests; allow * for public TV endpoint
+  const corsOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : (origin || '*');
+  res.setHeader('Access-Control-Allow-Origin', corsOrigin);
   res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Token');
   res.setHeader('Vary', 'Origin');
@@ -113,13 +115,23 @@ http.createServer((req, res) => {
       return;
     }
 
-    // GET /schedule — read schedule.json
+    // GET /schedule — read and decode schedule.json, return clean JSON
     if (req.method === 'GET') {
       ghRequest('GET', null, (err, data, status) => {
         if (err) { res.writeHead(500); res.end(JSON.stringify({ error: err })); return; }
-        res.writeHead(status === 404 ? 200 : status, { 'Content-Type': 'application/json' });
-        // 404 = file doesn't exist yet, return empty schedule
-        res.end(status === 404 ? JSON.stringify({ sessions: [] }) : data);
+        if (status === 404) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ sessions: [] })); return;
+        }
+        try {
+          const ghData = JSON.parse(data);
+          const schedule = JSON.parse(Buffer.from(ghData.content, 'base64').toString('utf8'));
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(schedule));
+        } catch(e) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ sessions: [] }));
+        }
       });
       return;
     }
