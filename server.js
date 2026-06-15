@@ -4,7 +4,11 @@ const crypto = require('crypto');
 
 const PORT        = process.env.PORT         || 3000;
 const GH_TOKEN    = process.env.GH_TOKEN;
-const SET_PASS    = process.env.SET_PASSWORD || 'RYST@set2026';
+if (!process.env.SET_PASSWORD) {
+  console.error('FATAL: SET_PASSWORD environment variable is required');
+  process.exit(1);
+}
+const SET_PASS = process.env.SET_PASSWORD;
 const GH_OWNER    = 'yuvanesanm';
 const GH_REPO     = 'signage';
 const GH_FILE     = 'schedule.json';
@@ -71,7 +75,7 @@ function ghRequest(method, body, cb) {
 
 http.createServer((req, res) => {
   const origin = req.headers.origin || '';
-  const corsOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : (origin || '*');
+  const corsOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : '';
   res.setHeader('Access-Control-Allow-Origin', corsOrigin);
   res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Token');
@@ -118,6 +122,14 @@ http.createServer((req, res) => {
         if (status === 404) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ sessions: [] })); return;
+        }
+        if (status === 403) {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'GitHub API rate limit reached — try again shortly' })); return;
+        }
+        if (status !== 200) {
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'GitHub API error: ' + status })); return;
         }
         try {
           const ghData = JSON.parse(data);
@@ -173,7 +185,13 @@ http.createServer((req, res) => {
   // GET /public-schedule — TV display, no auth required on this route but uses token internally
   if (req.method === 'GET' && url === '/public-schedule') {
     ghRequest('GET', null, (err, data, status) => {
-      if (err || status === 404) {
+      if (err || status === 404 || status === 403) {
+        if (status === 403) console.warn('GitHub API 403 on public-schedule — check GH_TOKEN permissions');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ sessions: [] })); return;
+      }
+      if (status !== 200) {
+        console.warn('GitHub API unexpected status on public-schedule:', status);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ sessions: [] })); return;
       }
