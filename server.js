@@ -13,6 +13,11 @@ const GH_OWNER    = 'yuvanesanm';
 const GH_REPO     = 'signage';
 const GH_FILE     = 'schedule.json';
 
+// Frigate (behind nginx Basic Auth) — credentials live here, never in the browser
+const FRIGATE_HOST = process.env.FRIGATE_HOST || 'frigate.ryst.in';
+const FRIGATE_USER = process.env.FRIGATE_USER;
+const FRIGATE_PASS = process.env.FRIGATE_PASS;
+
 const ALLOWED_ORIGINS = [
   'https://signage.ryst.in',
   'https://yuvanesanm.github.io',
@@ -208,6 +213,49 @@ http.createServer((req, res) => {
     return;
   }
 
+  // GET /frigate/api/... — authenticated read-only proxy to Frigate.
+  // Injects HTTP Basic Auth server-side so the camera password never reaches
+  // the browser. Only a whitelisted set of read-only endpoints is forwarded.
+  if (req.method === 'GET' && url.startsWith('/frigate/')) {
+    if (!FRIGATE_USER || !FRIGATE_PASS) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Frigate credentials not configured on proxy' }));
+      return;
+    }
+    const fwd = req.url.replace(/^\/frigate/, '');   // remainder, query string preserved
+    const fwdPath = fwd.split('?')[0];
+    const allowed =
+      /^\/api\/stats$/.test(fwdPath) ||
+      /^\/api\/events$/.test(fwdPath) ||
+      /^\/api\/[A-Za-z0-9_-]+\/latest\.jpg$/.test(fwdPath);
+    if (!allowed) { res.writeHead(403); res.end('Forbidden'); return; }
+
+    const auth = 'Basic ' + Buffer.from(`${FRIGATE_USER}:${FRIGATE_PASS}`).toString('base64');
+    const fReq = https.request({
+      hostname: FRIGATE_HOST,
+      path: fwd,
+      method: 'GET',
+      headers: { 'Authorization': auth, 'User-Agent': 'ryst-signage-proxy', 'Accept': '*/*' },
+    }, fRes => {
+      const chunks = [];
+      fRes.on('data', c => chunks.push(c));
+      fRes.on('end', () => {
+        res.writeHead(fRes.statusCode, {
+          'Content-Type': fRes.headers['content-type'] || 'application/octet-stream',
+          'Cache-Control': 'no-store',
+        });
+        res.end(Buffer.concat(chunks));
+      });
+    });
+    fReq.on('error', err => {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Frigate unreachable: ' + err.message }));
+    });
+    fReq.setTimeout(10000, () => fReq.destroy(new Error('timeout')));
+    fReq.end();
+    return;
+  }
+
   // Health check
   if (url === '/') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -225,4 +273,5 @@ http.createServer((req, res) => {
   console.log(`🎙️  RYST Signage Proxy running on port ${PORT}`);
   console.log(`    GH_TOKEN: ${GH_TOKEN ? '✓ set' : '✗ MISSING'}`);
   console.log(`    Password: ${SET_PASS ? '✓ set' : '✗ MISSING'}`);
+  console.log(`    Frigate:  ${FRIGATE_USER && FRIGATE_PASS ? '✓ creds set' : '✗ MISSING (set FRIGATE_USER / FRIGATE_PASS)'}`);
 });
