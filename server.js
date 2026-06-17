@@ -227,10 +227,43 @@ http.createServer((req, res) => {
     const allowed =
       /^\/api\/stats$/.test(fwdPath) ||
       /^\/api\/events$/.test(fwdPath) ||
+      /^\/api\/config$/.test(fwdPath) ||
       /^\/api\/[A-Za-z0-9_-]+\/latest\.jpg$/.test(fwdPath);
     if (!allowed) { res.writeHead(403); res.end('Forbidden'); return; }
 
     const auth = 'Basic ' + Buffer.from(`${FRIGATE_USER}:${FRIGATE_PASS}`).toString('base64');
+
+    // /api/config: fetch then strip RTSP paths (may contain camera credentials)
+    if (fwdPath === '/api/config') {
+      const cfgReq = https.request({
+        hostname: FRIGATE_HOST, path: fwd, method: 'GET',
+        headers: { 'Authorization': auth, 'User-Agent': 'ryst-signage-proxy', 'Accept': 'application/json' },
+      }, cfgRes => {
+        const chunks = [];
+        cfgRes.on('data', c => chunks.push(c));
+        cfgRes.on('end', () => {
+          try {
+            const cfg = JSON.parse(Buffer.concat(chunks).toString());
+            if (cfg.cameras) {
+              Object.values(cfg.cameras).forEach(cam => {
+                if (cam.ffmpeg && cam.ffmpeg.inputs) {
+                  cam.ffmpeg.inputs = cam.ffmpeg.inputs.map(i => ({ ...i, path: '[redacted]' }));
+                }
+              });
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            res.end(JSON.stringify(cfg, null, 2));
+          } catch(e) {
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Config parse error: ' + e.message }));
+          }
+        });
+      });
+      cfgReq.on('error', err => { res.writeHead(502); res.end(JSON.stringify({ error: err.message })); });
+      cfgReq.setTimeout(10000, () => cfgReq.destroy(new Error('timeout')));
+      cfgReq.end();
+      return;
+    }
     const fReq = https.request({
       hostname: FRIGATE_HOST,
       path: fwd,
