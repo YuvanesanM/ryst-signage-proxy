@@ -16,25 +16,30 @@ function cacheGet(key) {
   if (Date.now() > e.exp) { _cache.delete(key); return null; }
   return e;
 }
-function cacheSet(key, data, ct, ttl) {
-  _cache.set(key, { data, ct, exp: Date.now() + ttl });
+// Pre-compute the gzip form once at fill time so cache HITs never re-compress.
+function cacheSet(key, raw, ct, ttl) {
+  const entry = { raw, gz: zlib.gzipSync(raw), ct, exp: Date.now() + ttl };
+  _cache.set(key, entry);
+  return entry;
 }
 // Evict stale entries every 5 minutes to avoid memory growth
 setInterval(() => { const now = Date.now(); for (const [k,v] of _cache) if (now > v.exp) _cache.delete(k); }, 300_000);
 
-// ── gzip helper — compress if client accepts it ────────────────────────────
-function sendCompressed(req, res, status, ct, buf) {
-  const ae = (req.headers['accept-encoding'] || '');
-  if (ae.includes('gzip')) {
-    zlib.gzip(buf, (err, gz) => {
-      if (err) { res.writeHead(status, { 'Content-Type': ct }); res.end(buf); return; }
-      res.writeHead(status, { 'Content-Type': ct, 'Content-Encoding': 'gzip', 'Vary': 'Accept-Encoding' });
-      res.end(gz);
-    });
-  } else {
-    res.writeHead(status, { 'Content-Type': ct });
-    res.end(buf);
-  }
+// ── Serve a cache entry — picks the pre-gzipped body when the client accepts
+// gzip, else the raw body. Always no-store (downstream must respect our TTL,
+// not cache independently) and Vary: Accept-Encoding so shared caches never
+// hand a gzipped body to a client that didn't ask for it.
+function sendCacheEntry(req, res, entry, cacheState) {
+  const gzipOk = (req.headers['accept-encoding'] || '').includes('gzip');
+  const headers = {
+    'Content-Type': entry.ct,
+    'Cache-Control': 'no-store',
+    'Vary': 'Accept-Encoding',
+    'X-Cache': cacheState,
+  };
+  if (gzipOk) headers['Content-Encoding'] = 'gzip';
+  res.writeHead(200, headers);
+  res.end(gzipOk ? entry.gz : entry.raw);
 }
 
 const PORT        = process.env.PORT         || 3000;
@@ -268,21 +273,15 @@ http.createServer((req, res) => {
 
     const auth = 'Basic ' + Buffer.from(`${FRIGATE_USER}:${FRIGATE_PASS}`).toString('base64');
 
-    const isJson = fwdPath !== `/api/${fwdPath.split('/')[2]}/latest.jpg` &&
-                   !fwdPath.endsWith('.jpg');
+    // Only the JSON endpoints are cacheable; the lone image endpoint ends in .jpg.
+    const isJson = !fwdPath.endsWith('.jpg');
     const cacheKey = req.url; // includes query string
+    const ttl = isJson ? CACHE_TTL_MS[fwdPath] : 0;
 
-    // Serve from cache if fresh (JSON endpoints only, not images)
-    if (isJson) {
-      const ttl = CACHE_TTL_MS[fwdPath];
-      if (ttl) {
-        const hit = cacheGet(cacheKey);
-        if (hit) {
-          res.setHeader('X-Cache', 'HIT');
-          sendCompressed(req, res, 200, hit.ct, hit.data);
-          return;
-        }
-      }
+    // Serve from cache if fresh
+    if (ttl) {
+      const hit = cacheGet(cacheKey);
+      if (hit) { sendCacheEntry(req, res, hit, 'HIT'); return; }
     }
 
     // /api/config: fetch then strip RTSP paths (may contain camera credentials)
@@ -304,9 +303,8 @@ http.createServer((req, res) => {
               });
             }
             const out = Buffer.from(JSON.stringify(cfg));
-            cacheSet(cacheKey, out, 'application/json', CACHE_TTL_MS['/api/config']);
-            res.setHeader('X-Cache', 'MISS');
-            sendCompressed(req, res, 200, 'application/json', out);
+            const entry = cacheSet(cacheKey, out, 'application/json', CACHE_TTL_MS['/api/config']);
+            sendCacheEntry(req, res, entry, 'MISS');
           } catch(e) {
             res.writeHead(502, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'Config parse error: ' + e.message }));
@@ -330,12 +328,11 @@ http.createServer((req, res) => {
       fRes.on('end', () => {
         const buf = Buffer.concat(chunks);
         const ct  = fRes.headers['content-type'] || 'application/octet-stream';
-        const ttl = isJson ? CACHE_TTL_MS[fwdPath] : 0;
         if (ttl && fRes.statusCode === 200) {
-          cacheSet(cacheKey, buf, ct, ttl);
-          res.setHeader('X-Cache', 'MISS');
-          sendCompressed(req, res, 200, ct, buf);
+          const entry = cacheSet(cacheKey, buf, ct, ttl);
+          sendCacheEntry(req, res, entry, 'MISS');
         } else {
+          // Images and non-200s: pass through untouched, never cached.
           res.writeHead(fRes.statusCode, { 'Content-Type': ct, 'Cache-Control': 'no-store' });
           res.end(buf);
         }
