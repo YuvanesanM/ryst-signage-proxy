@@ -90,8 +90,8 @@ function verifyToken(token) {
 }
 
 // Authenticated GitHub API — used for reads (fresh data) and writes
-function ghRequest(method, body, cb) {
-  const path = `/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_FILE}`;
+function ghRequest(method, body, cb, file = GH_FILE) {
+  const path = `/repos/${GH_OWNER}/${GH_REPO}/contents/${file}`;
   const data = body ? JSON.stringify(body) : null;
   const opts = {
     hostname: 'api.github.com',
@@ -251,6 +251,60 @@ http.createServer((req, res) => {
       }
     });
     return;
+  }
+
+  // Generic authenticated GitHub file route factory used by /quotes and /rates.
+  // GET  → read file from GitHub, return decoded JSON
+  // PUT  → write body JSON to GitHub file
+  function ghFileRoute(ghFile, emptyDoc) {
+    const token = req.headers['x-token'] || '';
+    if (!verifyToken(token)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+    if (req.method === 'GET') {
+      ghRequest('GET', null, (err, data, status) => {
+        if (err) { res.writeHead(500); res.end(JSON.stringify({ error: err })); return; }
+        if (status === 404) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(emptyDoc)); return; }
+        if (status !== 200) { res.writeHead(502); res.end(JSON.stringify({ error: 'GitHub error ' + status })); return; }
+        try {
+          const parsed = JSON.parse(Buffer.from(JSON.parse(data).content, 'base64').toString('utf8'));
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(parsed));
+        } catch(e) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(emptyDoc)); }
+      }, ghFile);
+      return;
+    }
+    if (req.method === 'PUT') {
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', () => {
+        try { JSON.parse(body); } catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid JSON' })); return; }
+        ghRequest('GET', null, (err, existing, status) => {
+          const sha = status !== 404 ? (() => { try { return JSON.parse(existing).sha; } catch(e) { return null; } })() : null;
+          const content = Buffer.from(body).toString('base64');
+          const payload = { message: `Update ${ghFile} — ${new Date().toLocaleString('en-IN')}`, content, ...(sha ? { sha } : {}) };
+          ghRequest('PUT', payload, (err2, data2, status2) => {
+            if (err2) { res.writeHead(500); res.end(JSON.stringify({ error: err2 })); return; }
+            res.writeHead(status2, { 'Content-Type': 'application/json' });
+            res.end(data2);
+          }, ghFile);
+        }, ghFile);
+      });
+      return;
+    }
+    res.writeHead(405); res.end('Method not allowed');
+  }
+
+  // /quotes — saved quotations (GET read, PUT write)
+  if ((req.method === 'GET' || req.method === 'PUT') && url === '/quotes') {
+    ghFileRoute('quotes.json', { version: 1, quotes: [] }); return;
+  }
+
+  // /rates — rate card (GET read, PUT write)
+  if ((req.method === 'GET' || req.method === 'PUT') && url === '/rates') {
+    ghFileRoute('rates.json', { version: 1, rateCard: [] }); return;
   }
 
   // GET /frigate/api/... — authenticated read-only proxy to Frigate.
