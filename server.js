@@ -1,6 +1,41 @@
-const https = require('https');
-const http  = require('http');
+const https  = require('https');
+const http   = require('http');
 const crypto = require('crypto');
+const zlib   = require('zlib');
+
+// ── In-memory TTL cache for Frigate API responses ──────────────────────────
+const _cache = new Map();
+const CACHE_TTL_MS = {
+  '/api/stats':   15_000,   // 15 s  — FPS numbers update frequently
+  '/api/events':  45_000,   // 45 s  — dashboard polls every 60 s
+  '/api/config': 300_000,   // 5 min — rarely changes
+};
+function cacheGet(key) {
+  const e = _cache.get(key);
+  if (!e) return null;
+  if (Date.now() > e.exp) { _cache.delete(key); return null; }
+  return e;
+}
+function cacheSet(key, data, ct, ttl) {
+  _cache.set(key, { data, ct, exp: Date.now() + ttl });
+}
+// Evict stale entries every 5 minutes to avoid memory growth
+setInterval(() => { const now = Date.now(); for (const [k,v] of _cache) if (now > v.exp) _cache.delete(k); }, 300_000);
+
+// ── gzip helper — compress if client accepts it ────────────────────────────
+function sendCompressed(req, res, status, ct, buf) {
+  const ae = (req.headers['accept-encoding'] || '');
+  if (ae.includes('gzip')) {
+    zlib.gzip(buf, (err, gz) => {
+      if (err) { res.writeHead(status, { 'Content-Type': ct }); res.end(buf); return; }
+      res.writeHead(status, { 'Content-Type': ct, 'Content-Encoding': 'gzip', 'Vary': 'Accept-Encoding' });
+      res.end(gz);
+    });
+  } else {
+    res.writeHead(status, { 'Content-Type': ct });
+    res.end(buf);
+  }
+}
 
 const PORT        = process.env.PORT         || 3000;
 const GH_TOKEN    = process.env.GH_TOKEN;
@@ -233,6 +268,23 @@ http.createServer((req, res) => {
 
     const auth = 'Basic ' + Buffer.from(`${FRIGATE_USER}:${FRIGATE_PASS}`).toString('base64');
 
+    const isJson = fwdPath !== `/api/${fwdPath.split('/')[2]}/latest.jpg` &&
+                   !fwdPath.endsWith('.jpg');
+    const cacheKey = req.url; // includes query string
+
+    // Serve from cache if fresh (JSON endpoints only, not images)
+    if (isJson) {
+      const ttl = CACHE_TTL_MS[fwdPath];
+      if (ttl) {
+        const hit = cacheGet(cacheKey);
+        if (hit) {
+          res.setHeader('X-Cache', 'HIT');
+          sendCompressed(req, res, 200, hit.ct, hit.data);
+          return;
+        }
+      }
+    }
+
     // /api/config: fetch then strip RTSP paths (may contain camera credentials)
     if (fwdPath === '/api/config') {
       const cfgReq = https.request({
@@ -251,8 +303,10 @@ http.createServer((req, res) => {
                 }
               });
             }
-            res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-            res.end(JSON.stringify(cfg, null, 2));
+            const out = Buffer.from(JSON.stringify(cfg));
+            cacheSet(cacheKey, out, 'application/json', CACHE_TTL_MS['/api/config']);
+            res.setHeader('X-Cache', 'MISS');
+            sendCompressed(req, res, 200, 'application/json', out);
           } catch(e) {
             res.writeHead(502, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'Config parse error: ' + e.message }));
@@ -264,6 +318,7 @@ http.createServer((req, res) => {
       cfgReq.end();
       return;
     }
+
     const fReq = https.request({
       hostname: FRIGATE_HOST,
       path: fwd,
@@ -273,11 +328,17 @@ http.createServer((req, res) => {
       const chunks = [];
       fRes.on('data', c => chunks.push(c));
       fRes.on('end', () => {
-        res.writeHead(fRes.statusCode, {
-          'Content-Type': fRes.headers['content-type'] || 'application/octet-stream',
-          'Cache-Control': 'no-store',
-        });
-        res.end(Buffer.concat(chunks));
+        const buf = Buffer.concat(chunks);
+        const ct  = fRes.headers['content-type'] || 'application/octet-stream';
+        const ttl = isJson ? CACHE_TTL_MS[fwdPath] : 0;
+        if (ttl && fRes.statusCode === 200) {
+          cacheSet(cacheKey, buf, ct, ttl);
+          res.setHeader('X-Cache', 'MISS');
+          sendCompressed(req, res, 200, ct, buf);
+        } else {
+          res.writeHead(fRes.statusCode, { 'Content-Type': ct, 'Cache-Control': 'no-store' });
+          res.end(buf);
+        }
       });
     });
     fReq.on('error', err => {
