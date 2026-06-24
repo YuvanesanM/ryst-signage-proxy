@@ -312,6 +312,11 @@ http.createServer((req, res) => {
     ghFileRoute('stays.json', { version: 1, stays: [] }); return;
   }
 
+  // /stay-settings — RYST 109A villa business info, bank & pricing (GET/PUT)
+  if ((req.method === 'GET' || req.method === 'PUT') && url === '/stay-settings') {
+    ghFileRoute('stay-settings.json', { version: 1 }); return;
+  }
+
   // GET /frigate/api/... — authenticated read-only proxy to Frigate.
   // Injects HTTP Basic Auth server-side so the camera password never reaches
   // the browser. Only a whitelisted set of read-only endpoints is forwarded.
