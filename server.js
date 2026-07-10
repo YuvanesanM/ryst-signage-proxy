@@ -130,23 +130,64 @@ http.createServer((req, res) => {
 
   const url = req.url.split('?')[0];
 
-  // POST /auth — password -> token
+  // POST /auth — Google ID token -> session token
+  // Body: { googleIdToken: string }
+  // Verifies the token with Google's tokeninfo endpoint and checks the email
+  // against the allow-list. Returns { ok, token } on success.
   if (req.method === 'POST' && url === '/auth') {
+    const ALLOWED_EMAILS = ['mailyuvanesh@gmail.com', 'studioryst01@gmail.com'];
     let body = '';
     req.on('data', c => body += c);
     req.on('end', () => {
+      let googleIdToken;
       try {
-        const { password } = JSON.parse(body);
-        if (password === SET_PASS) {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, token: issueToken() }));
-        } else {
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'Incorrect password' }));
-        }
+        ({ googleIdToken } = JSON.parse(body));
       } catch(e) {
-        res.writeHead(400); res.end(JSON.stringify({ error: 'Bad request' }));
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Bad request' }));
+        return;
       }
+      if (!googleIdToken || typeof googleIdToken !== 'string') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Missing googleIdToken' }));
+        return;
+      }
+      // Verify ID token with Google's tokeninfo endpoint
+      const tokenPath = '/tokeninfo?id_token=' + encodeURIComponent(googleIdToken);
+      const tokenReq = https.request({
+        hostname: 'oauth2.googleapis.com',
+        path: tokenPath,
+        method: 'GET',
+        headers: { 'User-Agent': 'ryst-signage-proxy' },
+      }, tokenRes => {
+        let data = '';
+        tokenRes.on('data', c => data += c);
+        tokenRes.on('end', () => {
+          try {
+            const info = JSON.parse(data);
+            if (
+              tokenRes.statusCode === 200 &&
+              info.email_verified === 'true' &&
+              ALLOWED_EMAILS.includes(info.email)
+            ) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: true, token: issueToken() }));
+            } else {
+              res.writeHead(403, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'Access denied' }));
+            }
+          } catch(e) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Token verification failed' }));
+          }
+        });
+      });
+      tokenReq.on('error', () => {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Google verification unreachable' }));
+      });
+      tokenReq.setTimeout(10000, () => tokenReq.destroy(new Error('timeout')));
+      tokenReq.end();
     });
     return;
   }
@@ -426,7 +467,8 @@ http.createServer((req, res) => {
 
 }).listen(PORT, () => {
   console.log(`🎙️  RYST Signage Proxy running on port ${PORT}`);
-  console.log(`    GH_TOKEN: ${GH_TOKEN ? '✓ set' : '✗ MISSING'}`);
-  console.log(`    Password: ${SET_PASS ? '✓ set' : '✗ MISSING'}`);
-  console.log(`    Frigate:  ${FRIGATE_USER && FRIGATE_PASS ? '✓ creds set' : '✗ MISSING (set FRIGATE_USER / FRIGATE_PASS)'}`);
+  console.log(`    GH_TOKEN:      ${GH_TOKEN ? '✓ set' : '✗ MISSING'}`);
+  console.log(`    Token secret:  ${SET_PASS ? '✓ set' : '✗ MISSING'}`);
+  console.log(`    Google auth:   ✓ mailyuvanesh@gmail.com, studioryst01@gmail.com`);
+  console.log(`    Frigate:       ${FRIGATE_USER && FRIGATE_PASS ? '✓ creds set' : '✗ MISSING (set FRIGATE_USER / FRIGATE_PASS)'}`);
 });
