@@ -44,11 +44,6 @@ function sendCacheEntry(req, res, entry, cacheState) {
 
 const PORT        = process.env.PORT         || 3000;
 const GH_TOKEN    = process.env.GH_TOKEN;
-if (!process.env.SET_PASSWORD) {
-  console.error('FATAL: SET_PASSWORD environment variable is required');
-  process.exit(1);
-}
-const SET_PASS = process.env.SET_PASSWORD;
 const GH_OWNER    = 'yuvanesanm';
 const GH_REPO     = 'signage';
 const GH_FILE     = 'schedule.json';
@@ -66,10 +61,13 @@ const ALLOWED_ORIGINS = [
   'http://127.0.0.1:5500',
 ];
 
-const TOKEN_SECRET = crypto
-  .createHash('sha256')
-  .update('ryst-signage-proxy-' + SET_PASS)
-  .digest('hex');
+// TOKEN_SECRET signs issued session tokens. Set this env var on Render.
+// If absent, a random secret is generated at startup — tokens expire on restart.
+const _rawSecret = process.env.TOKEN_SECRET || process.env.SET_PASSWORD;
+if (!_rawSecret) console.warn('⚠  TOKEN_SECRET not set — session tokens will not survive a restart');
+const TOKEN_SECRET = _rawSecret
+  ? crypto.createHash('sha256').update('ryst-signage-proxy-' + _rawSecret).digest('hex')
+  : crypto.randomBytes(32).toString('hex');
 const TOKEN_TTL = 24 * 60 * 60 * 1000;
 
 function issueToken() {
@@ -468,7 +466,7 @@ http.createServer((req, res) => {
 }).listen(PORT, () => {
   console.log(`🎙️  RYST Signage Proxy running on port ${PORT}`);
   console.log(`    GH_TOKEN:      ${GH_TOKEN ? '✓ set' : '✗ MISSING'}`);
-  console.log(`    Token secret:  ${SET_PASS ? '✓ set' : '✗ MISSING'}`);
+  console.log(`    Token secret:  ${_rawSecret ? '✓ set (TOKEN_SECRET / SET_PASSWORD)' : '⚠  ephemeral (set TOKEN_SECRET)'}`);
   console.log(`    Google auth:   ✓ mailyuvanesh@gmail.com, studioryst01@gmail.com`);
   console.log(`    Frigate:       ${FRIGATE_USER && FRIGATE_PASS ? '✓ creds set' : '✗ MISSING (set FRIGATE_USER / FRIGATE_PASS)'}`);
 });
