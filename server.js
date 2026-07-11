@@ -55,6 +55,7 @@ const FRIGATE_PASS = process.env.FRIGATE_PASS;
 
 const ALLOWED_ORIGINS = [
   'https://signage.ryst.in',
+  'https://stay.ryst.in',
   'https://yuvanesanm.github.io',
   'http://localhost:3000',
   'http://localhost:5500',
