@@ -46,9 +46,6 @@ const PORT        = process.env.PORT         || 3000;
 const GH_TOKEN    = process.env.GH_TOKEN;
 const GH_OWNER    = 'yuvanesanm';
 const GH_REPO     = 'signage';
-// RYST 109A villa data (stay-settings, stays, petty-cash) lives in the
-// RYST-109A repo, not signage — it's 109A-only data, unrelated to Studio RYST.
-const GH_REPO_STAY = 'RYST-109A';
 const GH_FILE     = 'schedule.json';
 
 // Frigate (behind nginx Basic Auth) — credentials live here, never in the browser
@@ -58,7 +55,6 @@ const FRIGATE_PASS = process.env.FRIGATE_PASS;
 
 const ALLOWED_ORIGINS = [
   'https://signage.ryst.in',
-  'https://stay.ryst.in',
   'https://yuvanesanm.github.io',
   'http://localhost:3000',
   'http://localhost:5500',
@@ -71,21 +67,8 @@ const ALLOWED_ORIGINS = [
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID ||
   '717827758789-99ugj40a6j2rr4r7db26shn0hivq0vv0.apps.googleusercontent.com';
 
-// Owners can do everything (reimburse, top-up, set float, delete any entry).
-// Caretakers can only add/edit/delete their own pending expenses.
-const OWNER_EMAILS     = ['mailyuvanesh@gmail.com', 'studioryst01@gmail.com'];
-// ▼▼▼ ADD THE CARETAKER'S GMAIL HERE to let them log in ▼▼▼
-const CARETAKER_EMAILS = [/* 'caretaker@gmail.com' */];
-// ▲▲▲
-const ALLOWED_EMAILS   = [...OWNER_EMAILS, ...CARETAKER_EMAILS];
-function roleFor(email) { return OWNER_EMAILS.includes(email) ? 'owner' : 'caretaker'; }
-
-const MAX_BODY_BYTES = 16 * 1024;         // default request-body cap (16 KB)
-const PC_MAX_BODY_BYTES = 4 * 1024 * 1024; // petty-cash cap (4 MB, allows a receipt)
-const DEFAULT_PC_CATEGORIES = [
-  'Groceries', 'Utilities', 'Repairs & Maintenance', 'Housekeeping',
-  'Guest Supplies', 'Transport', 'Staff', 'Gardening', 'Pool', 'Miscellaneous',
-];
+const ALLOWED_EMAILS = ['mailyuvanesh@gmail.com', 'studioryst01@gmail.com'];
+const MAX_BODY_BYTES = 16 * 1024;   // reject request bodies larger than 16 KB
 
 // TOKEN_SECRET signs issued session tokens. Set this env var on Render.
 // If absent, a random secret is generated at startup — tokens expire on restart.
@@ -96,41 +79,31 @@ const TOKEN_SECRET = _rawSecret
   : crypto.randomBytes(32).toString('hex');
 const TOKEN_TTL = 24 * 60 * 60 * 1000;
 
-// Session token = base64url(payload).hmac, where payload carries the signed-in
-// email, role and expiry. Self-describing so routes can authorise by role.
-function b64url(str)     { return Buffer.from(str).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
-function b64urlDecode(s) { return Buffer.from(s.replace(/-/g,'+').replace(/_/g,'/'), 'base64').toString('utf8'); }
-
-function issueToken(email, role) {
-  const payload = b64url(JSON.stringify({ exp: Date.now() + TOKEN_TTL, email: email || null, role: role || 'owner' }));
-  const sig = crypto.createHmac('sha256', TOKEN_SECRET).update(payload).digest('hex');
-  return `${payload}.${sig}`;
+function issueToken() {
+  const exp = Date.now() + TOKEN_TTL;
+  const sig  = crypto.createHmac('sha256', TOKEN_SECRET).update(String(exp)).digest('hex');
+  return `${exp}.${sig}`;
 }
 
-// Returns the decoded payload object when the token is valid, else false.
-// (Truthy on success, so existing `if (!verifyToken(t))` guards keep working.)
 function verifyToken(token) {
-  if (!token || typeof token !== 'string') return false;
-  const dot = token.lastIndexOf('.');
+  if (!token) return false;
+  const dot = token.indexOf('.');
   if (dot < 0) return false;
-  const payload = token.slice(0, dot);
-  const sig     = token.slice(dot + 1);
+  const exp = parseInt(token.slice(0, dot));
+  const sig  = token.slice(dot + 1);
+  if (isNaN(exp) || Date.now() > exp) return false;
   // The HMAC-SHA256 signature is always 64 hex chars. Reject anything else
   // BEFORE timingSafeEqual — a non-hex or wrong-length sig yields a buffer of a
   // different length, and timingSafeEqual throws on a length mismatch, which
   // would otherwise become an uncaught exception and crash the process.
   if (!/^[0-9a-f]{64}$/.test(sig)) return false;
-  const expected = crypto.createHmac('sha256', TOKEN_SECRET).update(payload).digest('hex');
-  if (!crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expected, 'hex'))) return false;
-  let data;
-  try { data = JSON.parse(b64urlDecode(payload)); } catch(e) { return false; }
-  if (!data || typeof data.exp !== 'number' || Date.now() > data.exp) return false;
-  return data;
+  const expected = crypto.createHmac('sha256', TOKEN_SECRET).update(String(exp)).digest('hex');
+  return crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expected, 'hex'));
 }
 
 // Authenticated GitHub API — used for reads (fresh data) and writes
-function ghRequest(method, body, cb, file = GH_FILE, repo = GH_REPO) {
-  const path = `/repos/${GH_OWNER}/${repo}/contents/${file}`;
+function ghRequest(method, body, cb, file = GH_FILE) {
+  const path = `/repos/${GH_OWNER}/${GH_REPO}/contents/${file}`;
   const data = body ? JSON.stringify(body) : null;
   const opts = {
     hostname: 'api.github.com',
@@ -155,104 +128,6 @@ function ghRequest(method, body, cb, file = GH_FILE, repo = GH_REPO) {
   if (data) req.write(data);
   req.end();
 }
-
-// ── Petty cash ledger helpers ───────────────────────────────────────────────
-function pcId(prefix) {
-  return prefix + '_' + Date.now().toString(36) + '_' + crypto.randomBytes(3).toString('hex');
-}
-
-// Mutates the petty-cash `doc` in place according to `cmd`. Throws
-// { status, msg } on any validation or authorisation failure. `role` is
-// 'owner' or 'caretaker'; `email` is the signed-in user.
-function pcApplyCommand(doc, cmd, role, email) {
-  const isOwner = role === 'owner';
-  const toNum = v => { const n = Number(v); return isFinite(n) ? n : NaN; };
-  const ownerOnly = () => { if (!isOwner) throw { status: 403, msg: 'Only the owner can do this' }; };
-  const cleanReceipt = r => (typeof r === 'string' && r.startsWith('data:')) ? r : null;
-
-  switch (cmd.action) {
-    case 'add-expense': {
-      const amount = toNum(cmd.amount);
-      if (!(amount > 0)) throw { status: 400, msg: 'Amount must be greater than 0' };
-      if (!cmd.date)     throw { status: 400, msg: 'Date is required' };
-      doc.entries.push({
-        id: pcId('e'), type: 'expense', date: String(cmd.date),
-        category: String(cmd.category || 'Miscellaneous'), amount,
-        note: String(cmd.note || ''), receipt: cleanReceipt(cmd.receipt),
-        status: 'pending', reimbursementId: null,
-        createdBy: email, createdAt: Date.now(),
-      });
-      return;
-    }
-    case 'edit-expense': {
-      const ent = doc.entries.find(x => x.id === cmd.id && x.type === 'expense');
-      if (!ent) throw { status: 404, msg: 'Expense not found' };
-      if (!isOwner && (ent.createdBy !== email || ent.status !== 'pending'))
-        throw { status: 403, msg: 'You can only edit your own pending expenses' };
-      if (ent.status === 'reimbursed' && !isOwner)
-        throw { status: 403, msg: 'Reimbursed expenses cannot be edited' };
-      if (cmd.amount   !== undefined) { const a = toNum(cmd.amount); if (!(a > 0)) throw { status: 400, msg: 'Amount must be greater than 0' }; ent.amount = a; }
-      if (cmd.date     !== undefined) ent.date     = String(cmd.date);
-      if (cmd.category !== undefined) ent.category = String(cmd.category);
-      if (cmd.note     !== undefined) ent.note     = String(cmd.note);
-      if (cmd.receipt  !== undefined) ent.receipt  = cleanReceipt(cmd.receipt);
-      return;
-    }
-    case 'delete-entry': {
-      const idx = doc.entries.findIndex(x => x.id === cmd.id);
-      if (idx < 0) throw { status: 404, msg: 'Entry not found' };
-      const ent = doc.entries[idx];
-      if (!isOwner && (ent.type !== 'expense' || ent.createdBy !== email || ent.status !== 'pending'))
-        throw { status: 403, msg: 'You can only delete your own pending expenses' };
-      doc.entries.splice(idx, 1);
-      return;
-    }
-    case 'reimburse': {
-      ownerOnly();
-      const ids = Array.isArray(cmd.entryIds) ? cmd.entryIds : [];
-      const targets = doc.entries.filter(x => x.type === 'expense' && x.status === 'pending' && ids.includes(x.id));
-      if (!targets.length) throw { status: 400, msg: 'No pending expenses selected' };
-      const total = targets.reduce((s, x) => s + Number(x.amount || 0), 0);
-      const rid = pcId('r');
-      targets.forEach(t => { t.status = 'reimbursed'; t.reimbursementId = rid; });
-      doc.entries.push({
-        id: rid, type: 'topup', subtype: 'reimbursement',
-        date: String(cmd.date || new Date().toISOString().slice(0, 10)),
-        amount: total, note: String(cmd.note || `Reimbursed ${targets.length} expense(s)`),
-        coversIds: targets.map(t => t.id), createdBy: email, createdAt: Date.now(),
-      });
-      return;
-    }
-    case 'topup': {
-      ownerOnly();
-      const amount = toNum(cmd.amount);
-      if (!(amount > 0)) throw { status: 400, msg: 'Amount must be greater than 0' };
-      doc.entries.push({
-        id: pcId('t'), type: 'topup', subtype: 'cash',
-        date: String(cmd.date || new Date().toISOString().slice(0, 10)),
-        amount, note: String(cmd.note || 'Cash added to float'),
-        createdBy: email, createdAt: Date.now(),
-      });
-      return;
-    }
-    case 'set-float': {
-      ownerOnly();
-      const f = toNum(cmd.float);
-      if (!(f >= 0)) throw { status: 400, msg: 'Invalid float amount' };
-      doc.float = f;
-      return;
-    }
-    case 'set-categories': {
-      ownerOnly();
-      if (!Array.isArray(cmd.categories)) throw { status: 400, msg: 'Invalid categories' };
-      doc.categories = cmd.categories.map(String).map(s => s.trim()).filter(Boolean).slice(0, 40);
-      return;
-    }
-    default:
-      throw { status: 400, msg: 'Unknown action' };
-  }
-}
-
 
 http.createServer((req, res) => {
   const origin = req.headers.origin || '';
@@ -338,8 +213,7 @@ http.createServer((req, res) => {
               info.aud === GOOGLE_CLIENT_ID &&
               ALLOWED_EMAILS.includes(info.email)
             ) {
-              const role = roleFor(info.email);
-              reply(200, { ok: true, token: issueToken(info.email, role), email: info.email, role });
+              reply(200, { ok: true, token: issueToken() });
             } else {
               reply(403, { ok: false, error: 'Access denied' });
             }
@@ -358,92 +232,6 @@ http.createServer((req, res) => {
       const timeoutTimer = setTimeout(() => tokenReq.destroy(new Error('timeout')), 10000);
       tokenReq.end();
     });
-    return;
-  }
-
-  // /petty-cash — RYST 109A caretaker expense ledger (imprest float model).
-  //   GET  → current ledger document (any signed-in user)
-  //   POST → { action, ... } command, applied server-side with role checks and
-  //          optimistic-concurrency retry on the GitHub file SHA.
-  if (url === '/petty-cash') {
-    const auth = verifyToken(req.headers['x-token'] || '');
-    if (!auth) {
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Unauthorized' }));
-      return;
-    }
-    const role  = auth.role  || 'owner';
-    const email = auth.email || 'unknown';
-    const PC_FILE = 'petty-cash.json';
-    const freshDoc = () => ({ version: 1, float: 0, categories: DEFAULT_PC_CATEGORIES.slice(), entries: [] });
-
-    const loadDoc = cb => ghRequest('GET', null, (err, data, status) => {
-      if (err) return cb({ status: 502, msg: 'GitHub error' });
-      if (status === 404) return cb(null, freshDoc(), null);
-      if (status !== 200) return cb({ status: 502, msg: 'GitHub error ' + status });
-      try {
-        const gh = JSON.parse(data);
-        const doc = JSON.parse(Buffer.from(gh.content, 'base64').toString('utf8'));
-        cb(null, doc, gh.sha);
-      } catch(e) { cb(null, freshDoc(), null); }
-    }, PC_FILE, GH_REPO_STAY);
-
-    if (req.method === 'GET') {
-      loadDoc((e, doc) => {
-        if (e) { res.writeHead(e.status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: e.msg })); return; }
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(doc));
-      });
-      return;
-    }
-
-    if (req.method === 'POST') {
-      let body = '', aborted = false;
-      req.on('data', c => {
-        if (aborted) return;
-        body += c;
-        if (body.length > PC_MAX_BODY_BYTES) {
-          aborted = true;
-          res.writeHead(413, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Request too large (receipt over 4 MB?)' }));
-          req.destroy();
-        }
-      });
-      req.on('end', () => {
-        if (aborted) return;
-        let cmd;
-        try { cmd = JSON.parse(body); } catch(e) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Bad request' })); return;
-        }
-        const attempt = triesLeft => {
-          loadDoc((e, doc, sha) => {
-            if (e) { res.writeHead(e.status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: e.msg })); return; }
-            if (!Array.isArray(doc.entries)) doc.entries = [];
-            if (!Array.isArray(doc.categories)) doc.categories = DEFAULT_PC_CATEGORIES.slice();
-            try { pcApplyCommand(doc, cmd, role, email); }
-            catch(ex) {
-              res.writeHead(ex.status || 400, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ error: ex.msg || 'Error' })); return;
-            }
-            const content = Buffer.from(JSON.stringify(doc, null, 2)).toString('base64');
-            const payload = { message: `Petty cash — ${new Date().toLocaleString('en-IN')}`, content, ...(sha ? { sha } : {}) };
-            ghRequest('PUT', payload, (err2, data2, status2) => {
-              if (err2) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: err2 })); return; }
-              // 409/422 → SHA conflict from a concurrent write; reload and retry.
-              if ((status2 === 409 || status2 === 422) && triesLeft > 0) { attempt(triesLeft - 1); return; }
-              if (status2 !== 200 && status2 !== 201) { res.writeHead(502, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Write failed (' + status2 + ')' })); return; }
-              res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify(doc));
-            }, PC_FILE, GH_REPO_STAY);
-          });
-        };
-        attempt(3);
-      });
-      return;
-    }
-
-    res.writeHead(405); res.end('Method not allowed');
     return;
   }
 
@@ -549,13 +337,10 @@ http.createServer((req, res) => {
     return;
   }
 
-  // Generic authenticated GitHub file route factory used by /quotes, /rates,
-  // /stays and /stay-settings. `repo` defaults to the signage repo; the RYST
-  // 109A villa routes pass GH_REPO_STAY so that data lives in the RYST-109A
-  // repo instead.
+  // Generic authenticated GitHub file route factory used by /quotes and /rates.
   // GET  → read file from GitHub, return decoded JSON
   // PUT  → write body JSON to GitHub file
-  function ghFileRoute(ghFile, emptyDoc, repo = GH_REPO) {
+  function ghFileRoute(ghFile, emptyDoc) {
     const token = req.headers['x-token'] || '';
     if (!verifyToken(token)) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -572,7 +357,7 @@ http.createServer((req, res) => {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(parsed));
         } catch(e) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(emptyDoc)); }
-      }, ghFile, repo);
+      }, ghFile);
       return;
     }
     if (req.method === 'PUT') {
@@ -588,8 +373,8 @@ http.createServer((req, res) => {
             if (err2) { res.writeHead(500); res.end(JSON.stringify({ error: err2 })); return; }
             res.writeHead(status2, { 'Content-Type': 'application/json' });
             res.end(data2);
-          }, ghFile, repo);
-        }, ghFile, repo);
+          }, ghFile);
+        }, ghFile);
       });
       return;
     }
@@ -604,16 +389,6 @@ http.createServer((req, res) => {
   // /rates — rate card (GET read, PUT write)
   if ((req.method === 'GET' || req.method === 'PUT') && url === '/rates') {
     ghFileRoute('rates.json', { version: 1, rateCard: [] }); return;
-  }
-
-  // /stays — saved RYST 109A villa invoices & quotes (GET read, PUT write)
-  if ((req.method === 'GET' || req.method === 'PUT') && url === '/stays') {
-    ghFileRoute('stays.json', { version: 1, stays: [] }, GH_REPO_STAY); return;
-  }
-
-  // /stay-settings — RYST 109A villa business info, bank & pricing (GET/PUT)
-  if ((req.method === 'GET' || req.method === 'PUT') && url === '/stay-settings') {
-    ghFileRoute('stay-settings.json', { version: 1 }, GH_REPO_STAY); return;
   }
 
   // GET /frigate/api/... — authenticated read-only proxy to Frigate.
