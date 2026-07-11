@@ -46,6 +46,9 @@ const PORT        = process.env.PORT         || 3000;
 const GH_TOKEN    = process.env.GH_TOKEN;
 const GH_OWNER    = 'yuvanesanm';
 const GH_REPO     = 'signage';
+// RYST 109A villa data (stay-settings, stays, petty-cash) lives in the
+// RYST-109A repo, not signage — it's 109A-only data, unrelated to Studio RYST.
+const GH_REPO_STAY = 'RYST-109A';
 const GH_FILE     = 'schedule.json';
 
 // Frigate (behind nginx Basic Auth) — credentials live here, never in the browser
@@ -126,8 +129,8 @@ function verifyToken(token) {
 }
 
 // Authenticated GitHub API — used for reads (fresh data) and writes
-function ghRequest(method, body, cb, file = GH_FILE) {
-  const path = `/repos/${GH_OWNER}/${GH_REPO}/contents/${file}`;
+function ghRequest(method, body, cb, file = GH_FILE, repo = GH_REPO) {
+  const path = `/repos/${GH_OWNER}/${repo}/contents/${file}`;
   const data = body ? JSON.stringify(body) : null;
   const opts = {
     hostname: 'api.github.com',
@@ -383,7 +386,7 @@ http.createServer((req, res) => {
         const doc = JSON.parse(Buffer.from(gh.content, 'base64').toString('utf8'));
         cb(null, doc, gh.sha);
       } catch(e) { cb(null, freshDoc(), null); }
-    }, PC_FILE);
+    }, PC_FILE, GH_REPO_STAY);
 
     if (req.method === 'GET') {
       loadDoc((e, doc) => {
@@ -432,7 +435,7 @@ http.createServer((req, res) => {
               if (status2 !== 200 && status2 !== 201) { res.writeHead(502, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Write failed (' + status2 + ')' })); return; }
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify(doc));
-            }, PC_FILE);
+            }, PC_FILE, GH_REPO_STAY);
           });
         };
         attempt(3);
@@ -546,10 +549,13 @@ http.createServer((req, res) => {
     return;
   }
 
-  // Generic authenticated GitHub file route factory used by /quotes and /rates.
+  // Generic authenticated GitHub file route factory used by /quotes, /rates,
+  // /stays and /stay-settings. `repo` defaults to the signage repo; the RYST
+  // 109A villa routes pass GH_REPO_STAY so that data lives in the RYST-109A
+  // repo instead.
   // GET  → read file from GitHub, return decoded JSON
   // PUT  → write body JSON to GitHub file
-  function ghFileRoute(ghFile, emptyDoc) {
+  function ghFileRoute(ghFile, emptyDoc, repo = GH_REPO) {
     const token = req.headers['x-token'] || '';
     if (!verifyToken(token)) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -566,7 +572,7 @@ http.createServer((req, res) => {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(parsed));
         } catch(e) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(emptyDoc)); }
-      }, ghFile);
+      }, ghFile, repo);
       return;
     }
     if (req.method === 'PUT') {
@@ -582,8 +588,8 @@ http.createServer((req, res) => {
             if (err2) { res.writeHead(500); res.end(JSON.stringify({ error: err2 })); return; }
             res.writeHead(status2, { 'Content-Type': 'application/json' });
             res.end(data2);
-          }, ghFile);
-        }, ghFile);
+          }, ghFile, repo);
+        }, ghFile, repo);
       });
       return;
     }
@@ -602,12 +608,12 @@ http.createServer((req, res) => {
 
   // /stays — saved RYST 109A villa invoices & quotes (GET read, PUT write)
   if ((req.method === 'GET' || req.method === 'PUT') && url === '/stays') {
-    ghFileRoute('stays.json', { version: 1, stays: [] }); return;
+    ghFileRoute('stays.json', { version: 1, stays: [] }, GH_REPO_STAY); return;
   }
 
   // /stay-settings — RYST 109A villa business info, bank & pricing (GET/PUT)
   if ((req.method === 'GET' || req.method === 'PUT') && url === '/stay-settings') {
-    ghFileRoute('stay-settings.json', { version: 1 }); return;
+    ghFileRoute('stay-settings.json', { version: 1 }, GH_REPO_STAY); return;
   }
 
   // GET /frigate/api/... — authenticated read-only proxy to Frigate.
