@@ -61,6 +61,14 @@ const ALLOWED_ORIGINS = [
   'http://127.0.0.1:5500',
 ];
 
+// Google OAuth2 — only these accounts may sign in. GOOGLE_CLIENT_ID must match
+// the OAuth client the browser used, so ID tokens minted for other apps are
+// rejected (audience binding). Falls back to the known web client ID if unset.
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID ||
+  '717827758789-99ugj40a6j2rr4r7db26shn0hivq0vv0.apps.googleusercontent.com';
+const ALLOWED_EMAILS = ['mailyuvanesh@gmail.com', 'studioryst01@gmail.com'];
+const MAX_BODY_BYTES = 16 * 1024;   // reject request bodies larger than 16 KB
+
 // TOKEN_SECRET signs issued session tokens. Set this env var on Render.
 // If absent, a random secret is generated at startup — tokens expire on restart.
 const _rawSecret = process.env.TOKEN_SECRET || process.env.SET_PASSWORD;
@@ -83,6 +91,11 @@ function verifyToken(token) {
   const exp = parseInt(token.slice(0, dot));
   const sig  = token.slice(dot + 1);
   if (isNaN(exp) || Date.now() > exp) return false;
+  // The HMAC-SHA256 signature is always 64 hex chars. Reject anything else
+  // BEFORE timingSafeEqual — a non-hex or wrong-length sig yields a buffer of a
+  // different length, and timingSafeEqual throws on a length mismatch, which
+  // would otherwise become an uncaught exception and crash the process.
+  if (!/^[0-9a-f]{64}$/.test(sig)) return false;
   const expected = crypto.createHmac('sha256', TOKEN_SECRET).update(String(exp)).digest('hex');
   return crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expected, 'hex'));
 }
@@ -133,10 +146,21 @@ http.createServer((req, res) => {
   // Verifies the token with Google's tokeninfo endpoint and checks the email
   // against the allow-list. Returns { ok, token } on success.
   if (req.method === 'POST' && url === '/auth') {
-    const ALLOWED_EMAILS = ['mailyuvanesh@gmail.com', 'studioryst01@gmail.com'];
     let body = '';
-    req.on('data', c => body += c);
+    let aborted = false;
+    req.on('data', c => {
+      if (aborted) return;
+      body += c;
+      // Cap the incoming body so a malicious client can't OOM the process.
+      if (body.length > MAX_BODY_BYTES) {
+        aborted = true;
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Request too large' }));
+        req.destroy();
+      }
+    });
     req.on('end', () => {
+      if (aborted) return;
       let googleIdToken;
       try {
         ({ googleIdToken } = JSON.parse(body));
@@ -145,11 +169,24 @@ http.createServer((req, res) => {
         res.end(JSON.stringify({ ok: false, error: 'Bad request' }));
         return;
       }
-      if (!googleIdToken || typeof googleIdToken !== 'string') {
+      // Real Google JWTs are well under 4 KB. Reject oversized values before
+      // building a URL from them (avoids a 414 from Google → misleading 500).
+      if (!googleIdToken || typeof googleIdToken !== 'string' || googleIdToken.length > 4096) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: 'Missing googleIdToken' }));
+        res.end(JSON.stringify({ ok: false, error: 'Missing or invalid googleIdToken' }));
         return;
       }
+
+      // Guard against sending the HTTP response twice (e.g. the request-timeout
+      // fires after the tokeninfo response has already been handled).
+      let replied = false;
+      const reply = (status, payload) => {
+        if (replied || res.headersSent) return;
+        replied = true;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(payload));
+      };
+
       // Verify ID token with Google's tokeninfo endpoint
       const tokenPath = '/tokeninfo?id_token=' + encodeURIComponent(googleIdToken);
       const tokenReq = https.request({
@@ -159,32 +196,40 @@ http.createServer((req, res) => {
         headers: { 'User-Agent': 'ryst-signage-proxy' },
       }, tokenRes => {
         let data = '';
-        tokenRes.on('data', c => data += c);
+        let tokenAborted = false;
+        tokenRes.on('data', c => {
+          if (tokenAborted) return;
+          data += c;
+          if (data.length > MAX_BODY_BYTES) { tokenAborted = true; tokenRes.destroy(); }
+        });
         tokenRes.on('end', () => {
+          clearTimeout(timeoutTimer);
+          if (tokenAborted) { reply(502, { ok: false, error: 'Token verification failed' }); return; }
           try {
             const info = JSON.parse(data);
             if (
               tokenRes.statusCode === 200 &&
-              info.email_verified === 'true' &&
+              String(info.email_verified) === 'true' &&
+              info.aud === GOOGLE_CLIENT_ID &&
               ALLOWED_EMAILS.includes(info.email)
             ) {
-              res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ ok: true, token: issueToken() }));
+              reply(200, { ok: true, token: issueToken() });
             } else {
-              res.writeHead(403, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ ok: false, error: 'Access denied' }));
+              reply(403, { ok: false, error: 'Access denied' });
             }
           } catch(e) {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: false, error: 'Token verification failed' }));
+            reply(500, { ok: false, error: 'Token verification failed' });
           }
         });
       });
       tokenReq.on('error', () => {
-        res.writeHead(502, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: 'Google verification unreachable' }));
+        clearTimeout(timeoutTimer);
+        reply(502, { ok: false, error: 'Google verification unreachable' });
       });
-      tokenReq.setTimeout(10000, () => tokenReq.destroy(new Error('timeout')));
+      // Use a plain timer (cleared on completion) rather than socket.setTimeout,
+      // whose callback could fire on a lingering keep-alive socket after we have
+      // already replied.
+      const timeoutTimer = setTimeout(() => tokenReq.destroy(new Error('timeout')), 10000);
       tokenReq.end();
     });
     return;
@@ -467,6 +512,14 @@ http.createServer((req, res) => {
   console.log(`🎙️  RYST Signage Proxy running on port ${PORT}`);
   console.log(`    GH_TOKEN:      ${GH_TOKEN ? '✓ set' : '✗ MISSING'}`);
   console.log(`    Token secret:  ${_rawSecret ? '✓ set (TOKEN_SECRET / SET_PASSWORD)' : '⚠  ephemeral (set TOKEN_SECRET)'}`);
-  console.log(`    Google auth:   ✓ mailyuvanesh@gmail.com, studioryst01@gmail.com`);
+  console.log(`    Google auth:   ✓ ${ALLOWED_EMAILS.join(', ')}`);
+  console.log(`    Client ID:     ${GOOGLE_CLIENT_ID ? '✓ set' : '✗ MISSING'}`);
   console.log(`    Frigate:       ${FRIGATE_USER && FRIGATE_PASS ? '✓ creds set' : '✗ MISSING (set FRIGATE_USER / FRIGATE_PASS)'}`);
+});
+
+// Last-resort safety net: log unexpected errors instead of letting a single
+// bad request take the whole proxy down. Root causes are still fixed at the
+// call sites; this only prevents a total outage from an unforeseen edge case.
+process.on('uncaughtException', err => {
+  console.error('Uncaught exception (kept alive):', err && err.stack || err);
 });
