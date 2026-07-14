@@ -79,26 +79,36 @@ const TOKEN_SECRET = _rawSecret
   : crypto.randomBytes(32).toString('hex');
 const TOKEN_TTL = 24 * 60 * 60 * 1000;
 
-function issueToken() {
-  const exp = Date.now() + TOKEN_TTL;
-  const sig  = crypto.createHmac('sha256', TOKEN_SECRET).update(String(exp)).digest('hex');
-  return `${exp}.${sig}`;
+// Session token = base64url(payload).hmac, where payload carries the signed-in
+// email and expiry so routes can authorise per-account (e.g. the schedule lock).
+function b64url(str)     { return Buffer.from(str).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
+function b64urlDecode(s) { return Buffer.from(s.replace(/-/g,'+').replace(/_/g,'/'), 'base64').toString('utf8'); }
+
+function issueToken(email) {
+  const payload = b64url(JSON.stringify({ exp: Date.now() + TOKEN_TTL, email: email || null }));
+  const sig = crypto.createHmac('sha256', TOKEN_SECRET).update(payload).digest('hex');
+  return `${payload}.${sig}`;
 }
 
+// Returns the decoded payload object when valid, else false. (Truthy on success,
+// so existing `if (!verifyToken(t))` guards keep working.)
 function verifyToken(token) {
-  if (!token) return false;
-  const dot = token.indexOf('.');
+  if (!token || typeof token !== 'string') return false;
+  const dot = token.lastIndexOf('.');
   if (dot < 0) return false;
-  const exp = parseInt(token.slice(0, dot));
-  const sig  = token.slice(dot + 1);
-  if (isNaN(exp) || Date.now() > exp) return false;
+  const payload = token.slice(0, dot);
+  const sig     = token.slice(dot + 1);
   // The HMAC-SHA256 signature is always 64 hex chars. Reject anything else
   // BEFORE timingSafeEqual — a non-hex or wrong-length sig yields a buffer of a
   // different length, and timingSafeEqual throws on a length mismatch, which
   // would otherwise become an uncaught exception and crash the process.
   if (!/^[0-9a-f]{64}$/.test(sig)) return false;
-  const expected = crypto.createHmac('sha256', TOKEN_SECRET).update(String(exp)).digest('hex');
-  return crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expected, 'hex'));
+  const expected = crypto.createHmac('sha256', TOKEN_SECRET).update(payload).digest('hex');
+  if (!crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expected, 'hex'))) return false;
+  let data;
+  try { data = JSON.parse(b64urlDecode(payload)); } catch(e) { return false; }
+  if (!data || typeof data.exp !== 'number' || Date.now() > data.exp) return false;
+  return data;
 }
 
 // Authenticated GitHub API — used for reads (fresh data) and writes
@@ -127,6 +137,26 @@ function ghRequest(method, body, cb, file = GH_FILE) {
   req.on('error', err => cb(err.message, null, 500));
   if (data) req.write(data);
   req.end();
+}
+
+// ── Schedule edit-lock ──────────────────────────────────────────────────────
+// Accounts that may NOT edit or delete COMPLETED schedule sessions.
+const SCHEDULE_LOCK_EMAILS = ['studioryst01@gmail.com'];
+
+// A one-off session is "completed" once its date (India time) has passed, or its
+// end time has passed today. Recurring (days[]) and undated sessions never are.
+function sessionCompleted(s, todayIST, hhmmIST) {
+  if (!s || !s.date) return false;
+  if (s.date < todayIST) return true;
+  if (s.date > todayIST) return false;
+  return !!(s.end && hhmmIST >= s.end);
+}
+
+// Canonical JSON with recursively sorted keys — order-independent deep equality.
+function canonJSON(v) {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(canonJSON).join(',') + ']';
+  return '{' + Object.keys(v).sort().map(k => JSON.stringify(k) + ':' + canonJSON(v[k])).join(',') + '}';
 }
 
 http.createServer((req, res) => {
@@ -213,7 +243,7 @@ http.createServer((req, res) => {
               info.aud === GOOGLE_CLIENT_ID &&
               ALLOWED_EMAILS.includes(info.email)
             ) {
-              reply(200, { ok: true, token: issueToken() });
+              reply(200, { ok: true, token: issueToken(info.email), email: info.email });
             } else {
               reply(403, { ok: false, error: 'Access denied' });
             }
@@ -238,7 +268,8 @@ http.createServer((req, res) => {
   // /schedule — requires valid session token
   if (url === '/schedule') {
     const token = req.headers['x-token'] || '';
-    if (!verifyToken(token)) {
+    const auth = verifyToken(token);
+    if (!auth) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Unauthorized — invalid or expired token' }));
       return;
@@ -286,6 +317,33 @@ http.createServer((req, res) => {
             const sha = status !== 404 ? (() => {
               try { return JSON.parse(existing).sha; } catch(e) { return null; }
             })() : null;
+
+            // Enforce: SCHEDULE_LOCK_EMAILS accounts may not edit or delete a
+            // COMPLETED session. Every completed session in the stored copy must
+            // still be present, unchanged, in the incoming write.
+            if (SCHEDULE_LOCK_EMAILS.includes(auth.email)) {
+              let current = [];
+              if (status !== 404) {
+                try { current = (JSON.parse(Buffer.from(JSON.parse(existing).content, 'base64').toString('utf8')).sessions) || []; }
+                catch(e) { current = []; }
+              }
+              const nowIST   = new Date(Date.now() + 5.5 * 3600 * 1000);
+              const todayIST = nowIST.toISOString().slice(0, 10);
+              const hhmmIST  = nowIST.toISOString().slice(11, 16);
+              const incoming = new Map();
+              (scheduleData.sessions || []).forEach(s => { const k = canonJSON(s); incoming.set(k, (incoming.get(k) || 0) + 1); });
+              const tampered = current.some(s => {
+                if (!sessionCompleted(s, todayIST, hhmmIST)) return false;
+                const k = canonJSON(s), n = incoming.get(k) || 0;
+                if (n > 0) { incoming.set(k, n - 1); return false; }  // still present, untouched
+                return true;                                         // removed or modified
+              });
+              if (tampered) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Completed sessions are locked and cannot be edited or deleted by this account' }));
+                return;
+              }
+            }
 
             const content = Buffer.from(JSON.stringify(scheduleData, null, 2)).toString('base64');
             const payload = {
